@@ -1,0 +1,3 @@
+[submodule "java/json-doclet"]
+	path = java/json-doclet
+	url = https://github.com/kamichidu/java-json-doclet

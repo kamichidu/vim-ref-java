@@ -69,7 +69,7 @@ function! s:source.get_body(query)
         let body+= ['see  ' . join(doc.see, ', ')]
     endif
     let body+= ['']
-    let body+= [wwwrenderer#render_dom(s:H.parse('<html><body>' . doc.comment_text . '</body></html>'))]
+    let body+= s:render_dom(s:H.parse('<html><body>' . doc.comment_text . '</body></html>'))
     let body+= ['']
     let body+= ['Fields']
     if !empty(doc.fields)
@@ -141,6 +141,34 @@ endfunction
 
 function! s:shift_indent(lines)
     return map(copy(a:lines), '"    " . v:val')
+endfunction
+
+function! s:render_dom(dom)
+    try
+        let text= wwwrenderer#render_dom(a:dom)
+    catch /^Vim/
+        let text= a:dom.toString()
+    endtry
+
+    return s:L.flatten(map(split(text, "\n"), 's:wrap(v:val)'))
+endfunction
+
+function! s:wrap(text)
+    let words= split(a:text, '\s\+')
+    let lines= []
+    let buf= []
+    for word in words
+        if strlen(join(buf + [word])) <= &columns
+            let buf+= [word]
+        else
+            let lines+= [join(buf)]
+            let buf= []
+        endif
+    endfor
+    if !empty(buf)
+        let lines+= [join(buf)]
+    endif
+    return lines
 endfunction
 
 call ref#register_detection('java', 'java')

@@ -26,11 +26,32 @@ let s:V= vital#of('ref_java')
 let s:L= s:V.import('Data.List')
 let s:J= s:V.import('Web.JSON')
 let s:H= s:V.import('Web.HTML')
+let s:F= s:V.import('System.File')
+let s:M= s:V.import('Vim.Message')
 unlet s:V
 
 let s:source= {
 \   'name': 'java',
 \}
+
+let s:logging_enabled= get(g:, 'ref#java#enable_logging', 0)
+" XXX: for debug
+let s:logging_enabled= 1
+
+let s:data_dir= get(g:, 'ref#java#data_dir', expand('~/.ref_java/data/'))
+let s:work_dir= get(g:, 'ref#java#work_dir', expand('~/.ref_java/work/'))
+let s:log_dir=  get(g:, 'ref#java#log_dir',  expand('~/.ref_java/logs/'))
+
+let s:jsondoclet_jarpath= globpath(&runtimepath, 'bin/json-doclet-0.0.0-jar-with-dependencies.jar')
+
+try
+    call vimproc#version()
+    let s:has_vimproc= 1
+catch
+    let s:has_vimproc= 0
+endtry
+
+let s:empty_json= ['{"classes":[]}']
 
 "
 " memo
@@ -41,20 +62,23 @@ let s:source= {
 "
 
 function! s:source.available()
-    return 1
+    return executable('mvn')
 endfunction
 
 function! s:source.get_body(query)
     " create data
-    let javadoc= s:J.decode(join(self.cache('javadoc', function('s:make_javadoc')), ''))
+    let deps_javadoc= s:J.decode(join(self.cache(getcwd(), function('s:make_javadoc')), ''))
+    let jdk_javadoc= s:J.decode(join(self.cache($JAVA_HOME, function('s:make_jdk_javadoc')), ''))
 
-    let index= s:L.find_index(javadoc.classes, "v:val.name ==# '" . a:query . "'")
+    let classes= jdk_javadoc.classes + deps_javadoc.classes
+
+    let index= s:L.find_index(classes, "v:val.name ==# '" . a:query . "'")
 
     if index == -1
         throw printf("Sorry, no javadoc available for `%s'", a:query)
     endif
 
-    let doc= javadoc.classes[index]
+    let doc= classes[index]
 
     let body= ['class ' . doc.name]
     if !empty(doc.superclass)
@@ -92,19 +116,163 @@ endfunction
 
 function! s:source.complete(query)
     " create data
-    let javadoc= s:J.decode(join(self.cache('javadoc', function('s:make_javadoc')), ''))
+    let deps_javadoc= s:J.decode(join(self.cache(getcwd(), function('s:make_javadoc')), ''))
+    let jdk_javadoc= s:J.decode(join(self.cache($JAVA_HOME, function('s:make_jdk_javadoc')), ''))
 
-    return map(filter(javadoc.classes, 'v:val.name =~ a:query'), 'v:val.name')
+    let classes= jdk_javadoc.classes + deps_javadoc.classes
+
+    return map(filter(classes, 'v:val.name =~ a:query'), 'v:val.name')
 endfunction
 
-function! ref#java#define()
-    return deepcopy(s:source)
+function! ref#java#create_cache(java_home, target_dir)
+    let save_cwd= getcwd()
+    try
+        execute 'lcd' a:target_dir
+
+        if !filereadable('pom.xml')
+            return []
+        endif
+
+        let temporary_dir= s:join_path(s:work_dir, 'dependencies/')
+
+        call s:log(printf("Copy dependencies into `%s' using maven", temporary_dir))
+        " mvn dependency:copy-dependencies -Dclassifier=sources -DoutputDirectory=./deps
+        let output= s:systemlist(printf('mvn dependency:copy-dependencies -Dclassifier=sources -DoutputDirectory="%s"', temporary_dir))
+        call s:log("Copyed dependencies with output:", output)
+
+        let jars= split(globpath(temporary_dir, '*'), "\n")
+
+        let filenames= []
+        for jar in jars
+            let filename= s:create_data(a:java_home, jar)
+            if filereadable(filename)
+                let filenames+= [filename]
+            endif
+        endfor
+        return filenames
+    finally
+        execute 'lcd' save_cwd
+    endtry
+endfunction
+
+function! ref#java#create_jdk_doc(java_home)
+    if !filereadable(s:join_path(a:java_home, 'src.zip'))
+        return []
+    endif
+
+    let filename= s:create_data(a:java_home, s:join_path(a:java_home, 'src.zip'))
+    if filereadable(filename)
+        return [filename]
+    else
+        return []
+    endif
+endfunction
+
+function! s:create_data(java_home, jarpath)
+    if !filereadable(a:jarpath)
+        throw printf("ref-java: File not found `%s'", a:jarpath)
+    endif
+
+    call s:log('Start creating javadoc data')
+
+    let sources_dir= s:join_path(s:work_dir, 'sources/')
+    let json_dir= s:join_path(s:data_dir, 'json/')
+
+    call s:log(printf("sources_dir=`%s'", sources_dir))
+    call s:log(printf("json_dir=`%s'", json_dir))
+
+    " delete and create directories
+    if isdirectory(sources_dir)
+        call s:log('Remove sources_dir')
+        call s:F.rmdir(sources_dir, 'r')
+    endif
+    call s:log('Create sources_dir')
+    call mkdir(sources_dir, 'p')
+    if !isdirectory(json_dir)
+        call s:log('Create json_dir')
+        call mkdir(json_dir, 'p')
+    endif
+
+    let filename= s:escape(a:jarpath)
+
+    " skip if already cached
+    if filereadable(s:join_path(json_dir, filename))
+        return s:join_path(json_dir, filename)
+    endif
+
+    call s:log(printf("Copy a jar file `%s' into sources_dir", a:jarpath))
+    call s:F.copy(a:jarpath, s:join_path(sources_dir, 'target.jar'))
+
+    let save_cwd= getcwd()
+    try
+        execute 'lcd' sources_dir
+
+        call s:log("Extract jar file")
+        let output= s:systemlist(printf('"%s" -xf "%s"', s:join_path(a:java_home, 'bin/jar'), 'target.jar'))
+        call s:log("Finishing extracting jar file with output:", output)
+
+        call s:log("Collect filenames in jar")
+        let output= s:systemlist(printf('"%s" -tf "%s"', s:join_path(a:java_home, 'bin/jar'), 'target.jar'))
+        call s:log("Finishing collecting filenames with output:", output)
+        let files= filter(output, 'v:val =~# "\\.java$"')
+        call s:log("Collected filenames:", files)
+
+        call writefile(files, './ref_Java_files')
+
+        " make javadoc as json
+        call s:log("Generate javadoc")
+        let output= s:systemlist(join([
+        \   '"' . s:join_path(a:java_home, 'bin/javadoc') . '"',
+        \   printf('-docletpath "%s"', s:jsondoclet_jarpath),
+        \   '-doclet jp.michikusa.chitose.doclet.JsonDoclet',
+        \   printf('-ofile "%s"', s:join_path(json_dir, filename)),
+        \   '-J-Xmx512m',
+        \   '@ref_Java_files',
+        \]))
+        call s:log("Finishing generating javadoc with output:", output)
+        call s:log(printf("Generated javadoc as `%s'", filename))
+
+        return s:join_path(json_dir, filename)
+    finally
+        execute 'lcd' save_cwd
+    endtry
+endfunction
+
+function! s:escape(name)
+    return substitute(a:name, '[:;*?"<>|/\\%]', '\=printf("%%%02x", char2nr(submatch(0)))', 'g')
+endfunction
+
+function! s:systemlist(expr, ...)
+    let args= [a:expr] + (a:0 > 0 ? [a:1] : [])
+
+    if s:has_vimproc
+        return split(call('vimproc#system', args), "\n")
+    else
+        return split(call('system', args), "\n")
+    endif
 endfunction
 
 function! s:make_javadoc(name)
-    let json_filename= globpath(&runtimepath, 'jdk1.7.0_40.jsondoc')
+    " a:name ==# getcwd()
+    let filenames= ref#java#create_cache($JAVA_HOME, a:name)
 
-    return readfile(json_filename)
+    let merged= {'classes': []}
+    for filename in filenames
+        let doc= s:J.decode(join(readfile(filename), "\n"))
+        let merged.classes+= doc.classes
+    endfor
+    return [s:J.encode(merged)]
+endfunction
+
+function! s:make_jdk_javadoc(name)
+    " a:name ==# $JAVA_HOME
+    let filenames= ref#java#create_jdk_doc(a:name)
+
+    if !empty(filenames)
+        return readfile(filenames[0])
+    else
+        return deepcopy(s:empty_json)
+    endif
 endfunction
 
 function! s:format_field(doc)
@@ -169,6 +337,43 @@ function! s:wrap(text)
         let lines+= [join(buf)]
     endif
     return lines
+endfunction
+
+function! s:join_path(parent, filename)
+    let path= substitute(a:parent, '/\+$', '', '') . '/' . a:filename
+    return tr(path, '\', '/')
+endfunction
+
+" log('message', ['format', 'arg'])
+function! s:log(...)
+    if !s:logging_enabled
+        return
+    endif
+    if a:0 <= 0
+        return
+    endif
+
+    if !isdirectory(s:log_dir)
+        call mkdir(s:log_dir, 'p')
+    endif
+
+    let messages= []
+    for format in a:000
+        if type(format) == type([])
+            let messages+= format
+        else
+            let messages+= [format]
+        endif
+        unlet format
+    endfor
+    let filename= s:join_path(s:log_dir, strftime('%Y-%m-%d') . '.log')
+    let content= filereadable(filename) ? readfile(filename) : []
+
+    call writefile(content + messages, filename)
+endfunction
+
+function! ref#java#define()
+    return deepcopy(s:source)
 endfunction
 
 call ref#register_detection('java', 'java')

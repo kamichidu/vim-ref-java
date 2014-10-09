@@ -4,3 +4,5 @@ c0c39d5
 Data.List
 Web.JSON
 Web.HTML
+System.File
+Vim.Message
